@@ -30,12 +30,13 @@ src/
 ### Streaming over batch loading
 The CSV reader processes one row at a time via `rdr.deserialize()` — the entire file is never held in memory. This keeps memory usage flat regardless of file size.
 
-### Two HashMaps as the sole state
+### Two HashMaps and a HashSet as the sole state
 `PaymentsEngine` holds:
 - `accounts: HashMap<u16, Account>` — live balance per client
-- `transactions: HashMap<u32, StoredTx>` — only deposits and withdrawals that are eligible for future dispute
+- `transactions: HashMap<u32, StoredTx>` — deposits eligible for future dispute
+- `finalised_txs: HashSet<u32>` — tx IDs that have been resolved or chargebacked
 
-Resolved and chargebacked transactions are removed from the map immediately — there is no full transaction history. This bounds memory to the number of open (disputable) transactions, not total transaction count.
+When a transaction is resolved or chargebacked it is removed from `transactions` and its ID is moved into `finalised_txs`. This prevents tx ID reuse: a deposit or withdrawal whose `tx` appears in either map is silently rejected. Memory is bounded to open (disputable) transactions plus the set of finalised IDs, not total transaction count.
 
 ### `rust_decimal` for monetary arithmetic
 `f32`/`f64` cannot represent many decimal fractions exactly. `rust_decimal` uses a base-10 integer representation, giving exact arithmetic up to 28 significant digits. All amounts are stored and computed as `Decimal`, and formatted to 4 decimal places on output.
@@ -52,9 +53,9 @@ Malformed CSV rows (bad type, missing field, non-numeric amount) are printed to 
 - `tx` IDs are globally unique across all transaction types. A duplicate `tx` ID on a deposit or withdrawal is silently rejected.
 - Dispute, resolve, and chargeback reference an existing `tx` ID; they do not carry their own IDs.
 
-**Disputes apply only to stored transactions**
-- Only deposits and withdrawals are stored in `transactions`. A dispute against an unknown or already-resolved/chargebacked `tx` is ignored.
-- The engine does not distinguish whether the disputed tx was a deposit or withdrawal — both can be disputed. In practice, disputing a withdrawal has counterintuitive effects on the available balance (see Known Limitations).
+**Disputes apply only to deposits**
+- Only deposits are eligible for dispute. The engine checks `tx_type == Deposit` before accepting a dispute; disputes referencing a withdrawal tx ID are silently ignored.
+- A dispute against an unknown or already-resolved/chargebacked `tx` is also ignored.
 
 **Amounts are always positive**
 - Deposits and withdrawals with `amount <= 0` are rejected. Dispute, resolve, and chargeback carry no amount field and use the stored value.
@@ -73,7 +74,7 @@ Malformed CSV rows (bad type, missing field, non-numeric amount) are printed to 
 
 ## Known Limitations
 
-- **Disputing a withdrawal** moves funds from `available` to `held` a second time, which can drive `available` negative. The spec is ambiguous here; a production engine would store tx type and restrict disputes to deposits only.
+- **Disputes are restricted to deposits** — the engine checks `tx_type == Deposit` before accepting a dispute, so withdrawal disputes are silently ignored.
 - **`account.held` has no underflow guard** in `chargeback` or `resolve`. Under normal operation this cannot go negative, but it would if disputes are accepted on locked accounts (since `dispute` has no locked check).
 - **No persistence** — state lives in memory for the duration of the process only.
 
