@@ -168,6 +168,36 @@ impl PaymentsEngine {
 }
 
 #[cfg(test)]
+impl PaymentsEngine {
+    fn assert_invariants(&self) {
+        for (&client, acc) in &self.accounts {
+            // total() is defined as available + held, so this catches any future
+            // cached-total field that could drift out of sync
+            assert_eq!(
+                acc.total(),
+                acc.available + acc.held,
+                "client {client}: total() != available + held"
+            );
+            // held is only ever increased by dispute and decreased by resolve/chargeback;
+            // each path is guarded so held must never go negative
+            assert!(
+                acc.held >= Decimal::ZERO,
+                "client {client}: held is negative ({})",
+                acc.held
+            );
+        }
+        // a tx is moved from transactions → finalised_txs on resolve/chargeback;
+        // it must never exist in both simultaneously
+        for id in &self.finalised_txs {
+            assert!(
+                !self.transactions.contains_key(id),
+                "tx {id} exists in both transactions and finalised_txs"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
@@ -188,6 +218,7 @@ mod tests {
                 engine.apply(record);
             }
         }
+        engine.assert_invariants();
         engine
     }
 
@@ -302,5 +333,82 @@ mod tests {
         let a = acc(&e, 1);
         assert_eq!(a.available, d("100.0"));
         assert_eq!(a.held, Decimal::ZERO);
+    }
+
+    // --- invariant tests ---
+
+    #[test]
+    fn invariant_held_never_negative_after_chargeback() {
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nchargeback,1,1,",
+        );
+        // assert_invariants is called inside engine_from_csv; this asserts the
+        // final visible state too
+        assert_eq!(acc(&e, 1).held, Decimal::ZERO);
+    }
+
+    #[test]
+    fn invariant_held_never_negative_after_resolve() {
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nresolve,1,1,",
+        );
+        assert_eq!(acc(&e, 1).held, Decimal::ZERO);
+    }
+
+    #[test]
+    fn invariant_tx_not_in_both_maps_after_resolve() {
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nresolve,1,1,",
+        );
+        // tx 1 must be in finalised_txs and absent from transactions
+        assert!(e.finalised_txs.contains(&1));
+        assert!(!e.transactions.contains_key(&1));
+    }
+
+    #[test]
+    fn invariant_tx_not_in_both_maps_after_chargeback() {
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nchargeback,1,1,",
+        );
+        assert!(e.finalised_txs.contains(&1));
+        assert!(!e.transactions.contains_key(&1));
+    }
+
+    #[test]
+    fn invariant_held_correct_across_multiple_disputes() {
+        // two separate deposits, both disputed; held must equal sum of both amounts
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,40.0\ndeposit,1,2,60.0\ndispute,1,1,\ndispute,1,2,",
+        );
+        let a = acc(&e, 1);
+        assert_eq!(a.held, d("100.0"));
+        assert!(a.held >= Decimal::ZERO);
+    }
+
+    #[test]
+    fn invariant_held_correct_after_partial_resolve() {
+        // two disputes, one resolved — held must only contain the remaining disputed amount
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,40.0\ndeposit,1,2,60.0\ndispute,1,1,\ndispute,1,2,\nresolve,1,1,",
+        );
+        let a = acc(&e, 1);
+        assert_eq!(a.held, d("60.0"));
+        assert!(a.held >= Decimal::ZERO);
+    }
+
+    #[test]
+    fn invariant_multi_client_independent() {
+        // invariants must hold for every client independently
+        let e = engine_from_csv(
+            "type,client,tx,amount\n\
+             deposit,1,1,100.0\ndeposit,2,2,200.0\n\
+             dispute,1,1,\ndispute,2,2,\n\
+             chargeback,1,1,\nresolve,2,2,",
+        );
+        e.assert_invariants();
+        assert!(acc(&e, 1).locked);
+        assert!(!acc(&e, 2).locked);
+        assert_eq!(acc(&e, 1).held, Decimal::ZERO);
+        assert_eq!(acc(&e, 2).held, Decimal::ZERO);
     }
 }
