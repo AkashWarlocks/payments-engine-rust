@@ -24,6 +24,7 @@ pub struct StoredTx {
     pub client: u16,
     pub amount: Decimal,
     pub disputed: bool,
+    pub tx_type: TxType,
 }
 
 #[derive(Default)]

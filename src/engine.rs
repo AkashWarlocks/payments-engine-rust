@@ -2,12 +2,13 @@ use crate::error::Result;
 use crate::model::{Account, AccountRecord, StoredTx, TransactionRecord, TxType};
 use csv::ReaderBuilder;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 pub struct PaymentsEngine {
     accounts: HashMap<u16, Account>,
     transactions: HashMap<u32, StoredTx>,
+    finalised_txs: HashSet<u32>,
 }
 
 impl PaymentsEngine {
@@ -15,6 +16,7 @@ impl PaymentsEngine {
         Self {
             accounts: HashMap::new(),
             transactions: HashMap::new(),
+            finalised_txs: HashSet::new(),
         }
     }
 
@@ -46,7 +48,7 @@ impl PaymentsEngine {
                     client,
                     available: format!("{:.4}", available),
                     held: format!("{:.4}", held),
-                    total: format!("{:.4}", (available + held).round_dp(4)),
+                    total: format!("{:.4}", acc.total().round_dp(4)),
                     locked: acc.locked,
                 }
             })
@@ -71,28 +73,62 @@ impl PaymentsEngine {
 
     fn deposit(&mut self, client: u16, tx: u32, amount: Option<Decimal>) {
         let Some(amount) = amount else { return };
-        if amount <= Decimal::ZERO { return; }
-        if self.transactions.contains_key(&tx) { return; }
+        if amount <= Decimal::ZERO {
+            return;
+        }
+        if self.transactions.contains_key(&tx) || self.finalised_txs.contains(&tx) {
+            return;
+        }
         let account = self.accounts.entry(client).or_default();
-        if account.locked { return; }
+        if account.locked {
+            return;
+        }
         account.available += amount;
-        self.transactions.insert(tx, StoredTx { client, amount, disputed: false });
+        self.transactions.insert(
+            tx,
+            StoredTx {
+                client,
+                amount,
+                disputed: false,
+                tx_type: TxType::Deposit,
+            },
+        );
     }
 
     fn withdrawal(&mut self, client: u16, tx: u32, amount: Option<Decimal>) {
         let Some(amount) = amount else { return };
-        if amount <= Decimal::ZERO { return; }
-        if self.transactions.contains_key(&tx) { return; }
+        if amount <= Decimal::ZERO {
+            return;
+        }
+        if self.transactions.contains_key(&tx) || self.finalised_txs.contains(&tx) {
+            return;
+        }
         let account = self.accounts.entry(client).or_default();
-        if account.locked { return; }
-        if account.available < amount { return; }
+        if account.locked {
+            return;
+        }
+        if account.available < amount {
+            return;
+        }
         account.available -= amount;
-        self.transactions.insert(tx, StoredTx { client, amount, disputed: false });
+        self.transactions.insert(
+            tx,
+            StoredTx {
+                client,
+                amount,
+                disputed: false,
+                tx_type: TxType::Withdrawal,
+            },
+        );
     }
 
     fn dispute(&mut self, client: u16, tx: u32) {
-        let Some(stored) = self.transactions.get_mut(&tx) else { return };
-        if stored.client != client || stored.disputed { return; }
+        let Some(stored) = self.transactions.get_mut(&tx) else {
+            return;
+        };
+        if stored.client != client || stored.disputed || stored.tx_type != TxType::Deposit {
+            return;
+        }
         stored.disputed = true;
         let amount = stored.amount;
         let account = self.accounts.entry(client).or_default();
@@ -101,20 +137,30 @@ impl PaymentsEngine {
     }
 
     fn resolve(&mut self, client: u16, tx: u32) {
-        let Some(stored) = self.transactions.get_mut(&tx) else { return };
-        if stored.client != client || !stored.disputed { return; }
+        let Some(stored) = self.transactions.get_mut(&tx) else {
+            return;
+        };
+        if stored.client != client || !stored.disputed {
+            return;
+        }
         let amount = stored.amount;
         self.transactions.remove(&tx);
+        self.finalised_txs.insert(tx);
         let account = self.accounts.entry(client).or_default();
         account.held -= amount;
         account.available += amount;
     }
 
     fn chargeback(&mut self, client: u16, tx: u32) {
-        let Some(stored) = self.transactions.get_mut(&tx) else { return };
-        if stored.client != client || !stored.disputed { return; }
+        let Some(stored) = self.transactions.get_mut(&tx) else {
+            return;
+        };
+        if stored.client != client || !stored.disputed {
+            return;
+        }
         let amount = stored.amount;
         self.transactions.remove(&tx);
+        self.finalised_txs.insert(tx);
         let account = self.accounts.entry(client).or_default();
         account.held -= amount;
         account.locked = true;
@@ -161,17 +207,13 @@ mod tests {
 
     #[test]
     fn withdrawal_decreases_available() {
-        let e = engine_from_csv(
-            "type,client,tx,amount\ndeposit,1,1,100.0\nwithdrawal,1,2,30.0",
-        );
+        let e = engine_from_csv("type,client,tx,amount\ndeposit,1,1,100.0\nwithdrawal,1,2,30.0");
         assert_eq!(acc(&e, 1).available, d("70.0"));
     }
 
     #[test]
     fn withdrawal_fails_if_insufficient_funds() {
-        let e = engine_from_csv(
-            "type,client,tx,amount\ndeposit,1,1,50.0\nwithdrawal,1,2,100.0",
-        );
+        let e = engine_from_csv("type,client,tx,amount\ndeposit,1,1,50.0\nwithdrawal,1,2,100.0");
         assert_eq!(acc(&e, 1).available, d("50.0"));
     }
 
@@ -196,9 +238,8 @@ mod tests {
 
     #[test]
     fn resolve_releases_held_funds() {
-        let e = engine_from_csv(
-            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nresolve,1,1,",
-        );
+        let e =
+            engine_from_csv("type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nresolve,1,1,");
         let a = acc(&e, 1);
         assert_eq!(a.available, d("100.0"));
         assert_eq!(a.held, Decimal::ZERO);
@@ -219,9 +260,7 @@ mod tests {
 
     #[test]
     fn duplicate_tx_id_is_rejected() {
-        let e = engine_from_csv(
-            "type,client,tx,amount\ndeposit,1,1,100.0\ndeposit,1,1,50.0",
-        );
+        let e = engine_from_csv("type,client,tx,amount\ndeposit,1,1,100.0\ndeposit,1,1,50.0");
         assert_eq!(acc(&e, 1).available, d("100.0"));
     }
 
@@ -242,10 +281,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_client_dispute_is_ignored() {
+    fn tx_id_reuse_after_resolve_is_rejected() {
         let e = engine_from_csv(
-            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,2,1,",
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nresolve,1,1,\ndeposit,1,1,50.0",
         );
+        assert_eq!(acc(&e, 1).available, d("100.0"));
+    }
+
+    #[test]
+    fn tx_id_reuse_after_chargeback_is_rejected() {
+        let e = engine_from_csv(
+            "type,client,tx,amount\ndeposit,1,1,100.0\ndispute,1,1,\nchargeback,1,1,\ndeposit,2,1,50.0",
+        );
+        assert!(!e.accounts.contains_key(&2));
+    }
+
+    #[test]
+    fn cross_client_dispute_is_ignored() {
+        let e = engine_from_csv("type,client,tx,amount\ndeposit,1,1,100.0\ndispute,2,1,");
         let a = acc(&e, 1);
         assert_eq!(a.available, d("100.0"));
         assert_eq!(a.held, Decimal::ZERO);
