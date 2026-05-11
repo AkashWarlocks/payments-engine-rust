@@ -1,0 +1,29 @@
+[package]
+name = "payments-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+csv = "1"
+
+[dependencies.payments-engine]
+path = ".."
+
+[[bin]]
+name = "fuzz_target_1"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_single_record"
+path = "fuzz_targets/fuzz_single_record.rs"
+test = false
+doc = false
+bench = false

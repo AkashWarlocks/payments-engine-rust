@@ -34,12 +34,23 @@ impl PaymentsEngine {
     /// Returns an error if the file cannot be opened or read.
     pub fn process_file(&mut self, path: &str) -> Result<()> {
         let file = std::fs::File::open(path)?;
+        self.process_reader(file)
+    }
+
+    /// Reads and applies all transactions from an arbitrary byte reader.
+    ///
+    /// Same behaviour as `process_file`: malformed rows are skipped, not fatal.
+    /// Exposed separately so fuzz targets can feed arbitrary bytes without the filesystem.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying reader fails.
+    pub fn process_reader<R: std::io::Read>(&mut self, reader: R) -> Result<()> {
         let mut rdr = ReaderBuilder::new()
             // trim(All): input files may have spaces around field values
             .trim(csv::Trim::All)
             // flexible(true): dispute/resolve/chargeback rows legally omit the amount column
             .flexible(true)
-            .from_reader(file);
+            .from_reader(reader);
 
         for result in rdr.deserialize::<TransactionRecord>() {
             match result {

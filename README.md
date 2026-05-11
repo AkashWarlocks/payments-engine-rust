@@ -10,19 +10,53 @@ cargo run -- transactions.csv
 
 # Redirect output to a file
 cargo run -- transactions.csv > accounts.csv
+```
 
-# Run tests
+## Testing
+
+Three layers of tests, all in `src/engine.rs`:
+
+```bash
 cargo test
 ```
+
+| Layer | What it covers |
+|---|---|
+| **Unit** (20 tests) | Individual operations and edge cases — duplicate IDs, cross-client disputes, locked accounts, tx ID reuse after finalisation |
+| **Invariant** (7 tests) | State correctness after every operation — `held >= 0`, `total == available + held`, tx IDs never live in both `transactions` and `finalised_txs` simultaneously |
+| **Property** (9 tests, 100 cases each) | Arithmetic properties across random amounts — deposit round-trips, withdrawal never overdrafts, dispute preserves total, arbitrary op sequences never violate invariants |
+
+### Fuzz testing
+
+Requires nightly:
+
+```bash
+# Full pipeline — arbitrary bytes as CSV input, engine must never panic
+cargo +nightly fuzz run fuzz_target_1
+
+# CSV deserialiser only — isolates serde/csv parsing panics
+cargo +nightly fuzz run fuzz_single_record
+
+# Time-limited run
+cargo +nightly fuzz run fuzz_target_1 -- -max_total_time=60
+```
+
+Corpus is seeded from `transactions.csv` in `fuzz/corpus/`. Crashes land in `fuzz/artifacts/`.
 
 ## Project Structure
 
 ```
 src/
 ├── main.rs       # CLI entry point — reads args, wires engine to stdout
+├── lib.rs        # Library root — re-exports PaymentsEngine for fuzz targets
 ├── engine.rs     # PaymentsEngine — all transaction logic and CSV I/O
 ├── model.rs      # Types: TransactionRecord, StoredTx, Account, AccountRecord
 └── error.rs      # AppError wrapping std::io::Error and csv::Error
+fuzz/
+├── fuzz_targets/
+│   ├── fuzz_target_1.rs      # Fuzzes the full CSV → engine pipeline
+│   └── fuzz_single_record.rs # Fuzzes CSV deserialisation of a single row
+└── corpus/                   # Seed inputs for the fuzzer
 ```
 
 ## Architecture Decisions

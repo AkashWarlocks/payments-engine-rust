@@ -1,10 +1,6 @@
 //! CLI entry point — reads a transaction CSV and writes final account states to stdout.
 
-mod engine;
-mod error;
-mod model;
-
-use engine::PaymentsEngine;
+use payments_engine::PaymentsEngine;
 use std::{env, io, process};
 
 fn main() {
