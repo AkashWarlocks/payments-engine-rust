@@ -2,6 +2,8 @@
 
 A streaming CSV payments processor written in Rust. Reads a transaction ledger, applies deposit, withdrawal, dispute, resolve, and chargeback operations, and outputs final account states to stdout.
 
+> **AI usage:** This project was built with Claude Code as a pair-programming tool. See [`ai_chat.md`](ai_chat.md) for a summary of code review findings, testing strategy decisions, and what was accepted or rejected.
+
 ## How to Run
 
 ```bash
