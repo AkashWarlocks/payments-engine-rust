@@ -1,3 +1,5 @@
+//! CLI entry point — reads a transaction CSV and writes final account states to stdout.
+
 mod engine;
 mod error;
 mod model;

@@ -5,6 +5,12 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
+/// Processes payment transactions and maintains per-client account state.
+///
+/// Three collections form the complete state:
+/// - `accounts`: live balance per client
+/// - `transactions`: deposits eligible for future dispute (removed on finalisation)
+/// - `finalised_txs`: tx IDs retired via resolve/chargeback, kept only to block ID reuse
 pub struct PaymentsEngine {
     accounts: HashMap<u16, Account>,
     transactions: HashMap<u32, StoredTx>,
@@ -20,10 +26,18 @@ impl PaymentsEngine {
         }
     }
 
+    /// Reads and applies all transactions from a CSV file at `path`.
+    ///
+    /// Malformed rows are printed to stderr and skipped; processing continues.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be opened or read.
     pub fn process_file(&mut self, path: &str) -> Result<()> {
         let file = std::fs::File::open(path)?;
         let mut rdr = ReaderBuilder::new()
+            // trim(All): input files may have spaces around field values
             .trim(csv::Trim::All)
+            // flexible(true): dispute/resolve/chargeback rows legally omit the amount column
             .flexible(true)
             .from_reader(file);
 
@@ -36,6 +50,10 @@ impl PaymentsEngine {
         Ok(())
     }
 
+    /// Serialises all account states as CSV to `writer`, sorted by client ID.
+    ///
+    /// # Errors
+    /// Returns an error if serialisation or flushing fails.
     pub fn write_accounts<W: Write>(&self, writer: W) -> Result<()> {
         let mut wtr = csv::WriterBuilder::new().from_writer(writer);
         let mut records: Vec<AccountRecord> = self
@@ -53,6 +71,7 @@ impl PaymentsEngine {
                 }
             })
             .collect();
+        // HashMap iteration order is non-deterministic; sort for reproducible output
         records.sort_by_key(|r| r.client);
         for record in &records {
             wtr.serialize(record)?;
@@ -76,6 +95,8 @@ impl PaymentsEngine {
         if amount <= Decimal::ZERO {
             return;
         }
+        // reject if tx ID was already used — finalised_txs catches IDs that were
+        // removed from the live map after resolve/chargeback, preventing reuse
         if self.transactions.contains_key(&tx) || self.finalised_txs.contains(&tx) {
             return;
         }
@@ -100,6 +121,7 @@ impl PaymentsEngine {
         if amount <= Decimal::ZERO {
             return;
         }
+        // same dual-map check as deposit — prevents tx ID reuse after finalisation
         if self.transactions.contains_key(&tx) || self.finalised_txs.contains(&tx) {
             return;
         }
@@ -126,9 +148,13 @@ impl PaymentsEngine {
         let Some(stored) = self.transactions.get_mut(&tx) else {
             return;
         };
+        // only deposits are disputable — disputing a withdrawal would move funds
+        // to held that were already removed from available, driving available negative
         if stored.client != client || stored.disputed || stored.tx_type != TxType::Deposit {
             return;
         }
+        // no locked check: a chargeback only blocks new deposits/withdrawals;
+        // disputes on pre-existing stored transactions remain valid after locking
         stored.disputed = true;
         let amount = stored.amount;
         let account = self.accounts.entry(client).or_default();
@@ -144,6 +170,8 @@ impl PaymentsEngine {
             return;
         }
         let amount = stored.amount;
+        // move to finalised_txs rather than just removing — prevents this tx ID
+        // from being accepted again in a future deposit or withdrawal
         self.transactions.remove(&tx);
         self.finalised_txs.insert(tx);
         let account = self.accounts.entry(client).or_default();
@@ -159,6 +187,7 @@ impl PaymentsEngine {
             return;
         }
         let amount = stored.amount;
+        // same finalisation pattern as resolve: retire the tx ID to block reuse
         self.transactions.remove(&tx);
         self.finalised_txs.insert(tx);
         let account = self.accounts.entry(client).or_default();
@@ -333,6 +362,155 @@ mod tests {
         let a = acc(&e, 1);
         assert_eq!(a.available, d("100.0"));
         assert_eq!(a.held, Decimal::ZERO);
+    }
+
+    // --- property tests ---
+
+    mod property {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_amount() -> impl Strategy<Value = Decimal> {
+            // 0.01 to 1000.00 — stays well within Decimal precision and avoids overflow
+            // when summing up to ~20 deposits in the sequence test
+            (1u64..=100_000u64).prop_map(|n| Decimal::new(n as i64, 2))
+        }
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Deposit,
+            Withdrawal,
+            Dispute,
+            Resolve,
+            Chargeback,
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            // weight deposits higher so generated sequences contain more valid state
+            prop_oneof![
+                3 => Just(Op::Deposit),
+                2 => Just(Op::Withdrawal),
+                2 => Just(Op::Dispute),
+                1 => Just(Op::Resolve),
+                1 => Just(Op::Chargeback),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn deposit_increases_available_by_exact_amount(amount in arb_amount()) {
+                let csv = format!("type,client,tx,amount\ndeposit,1,1,{amount}");
+                let e = engine_from_csv(&csv);
+                prop_assert_eq!(e.accounts[&1u16].available, amount);
+                prop_assert_eq!(e.accounts[&1u16].held, Decimal::ZERO);
+            }
+
+            #[test]
+            fn deposit_then_full_withdrawal_zeroes_balance(amount in arb_amount()) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{amount}\nwithdrawal,1,2,{amount}"
+                );
+                let e = engine_from_csv(&csv);
+                let a = &e.accounts[&1u16];
+                prop_assert_eq!(a.available, Decimal::ZERO);
+                prop_assert_eq!(a.total(), Decimal::ZERO);
+            }
+
+            #[test]
+            fn withdrawal_never_overdrafts_available(
+                deposit in arb_amount(),
+                withdrawal in arb_amount()
+            ) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{deposit}\nwithdrawal,1,2,{withdrawal}"
+                );
+                let e = engine_from_csv(&csv);
+                prop_assert!(e.accounts[&1u16].available >= Decimal::ZERO);
+            }
+
+            #[test]
+            fn dispute_preserves_total(amount in arb_amount()) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{amount}\ndispute,1,1,"
+                );
+                let e = engine_from_csv(&csv);
+                let a = &e.accounts[&1u16];
+                prop_assert_eq!(a.total(), amount);
+                prop_assert_eq!(a.held, amount);
+                prop_assert_eq!(a.available, Decimal::ZERO);
+            }
+
+            #[test]
+            fn dispute_then_resolve_is_a_no_op(amount in arb_amount()) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{amount}\ndispute,1,1,\nresolve,1,1,"
+                );
+                let e = engine_from_csv(&csv);
+                let a = &e.accounts[&1u16];
+                prop_assert_eq!(a.available, amount);
+                prop_assert_eq!(a.held, Decimal::ZERO);
+                prop_assert!(!a.locked);
+            }
+
+            #[test]
+            fn chargeback_always_locks_account(amount in arb_amount()) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{amount}\ndispute,1,1,\nchargeback,1,1,"
+                );
+                let e = engine_from_csv(&csv);
+                prop_assert!(e.accounts[&1u16].locked);
+                prop_assert_eq!(e.accounts[&1u16].held, Decimal::ZERO);
+            }
+
+            #[test]
+            fn multiple_deposits_accumulate_correctly(
+                a1 in arb_amount(),
+                a2 in arb_amount(),
+                a3 in arb_amount()
+            ) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{a1}\ndeposit,1,2,{a2}\ndeposit,1,3,{a3}"
+                );
+                let e = engine_from_csv(&csv);
+                prop_assert_eq!(e.accounts[&1u16].available, a1 + a2 + a3);
+            }
+
+            #[test]
+            fn duplicate_tx_id_counts_only_first_deposit(
+                a1 in arb_amount(),
+                a2 in arb_amount()
+            ) {
+                let csv = format!(
+                    "type,client,tx,amount\ndeposit,1,1,{a1}\ndeposit,1,1,{a2}"
+                );
+                let e = engine_from_csv(&csv);
+                prop_assert_eq!(e.accounts[&1u16].available, a1);
+            }
+
+            // most powerful test: arbitrary sequences of all op types across multiple
+            // clients with overlapping tx IDs — engine must never violate invariants
+            #[test]
+            fn invariants_hold_after_arbitrary_op_sequence(
+                ops in proptest::collection::vec(
+                    (arb_op(), 1u16..=3u16, 1u32..=10u32, arb_amount()),
+                    1..20
+                )
+            ) {
+                let header = "type,client,tx,amount";
+                let rows: Vec<String> = ops.iter().map(|(op, client, tx, amount)| {
+                    match op {
+                        Op::Deposit    => format!("deposit,{client},{tx},{amount}"),
+                        Op::Withdrawal => format!("withdrawal,{client},{tx},{amount}"),
+                        Op::Dispute    => format!("dispute,{client},{tx},"),
+                        Op::Resolve    => format!("resolve,{client},{tx},"),
+                        Op::Chargeback => format!("chargeback,{client},{tx},"),
+                    }
+                }).collect();
+                let csv = format!("{header}\n{}", rows.join("\n"));
+                // engine_from_csv calls assert_invariants() on the result
+                engine_from_csv(&csv);
+            }
+        }
     }
 
     // --- invariant tests ---
